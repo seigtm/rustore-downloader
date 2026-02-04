@@ -18,6 +18,35 @@ const formatFileSize = bytes => {
 };
 const formatDate = date => new Date(date).toLocaleDateString();
 const roundToDecimal = (num, places = 2) => Math.round(num * 10**places) / 10**places;
+const escapeHtml = (value) => String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const guessAndroidScreenDensity = () => {
+    // Android density buckets (dpi): 160 mdpi, 240 hdpi, 320 xhdpi, 480 xxhdpi, 640 xxxhdpi.
+    // Some RuStore apps return empty downloadUrls for low/zero densities, so we clamp to >= 240.
+    const dpr = Number(window.devicePixelRatio || 1);
+    let density;
+    if (dpr >= 4) density = 640;
+    else if (dpr >= 3) density = 480;
+    else if (dpr >= 2) density = 320;
+    else if (dpr >= 1.5) density = 240;
+    else density = 160;
+    return Math.max(240, density);
+};
+
+const basenameFromUrl = (url) => {
+    try {
+        const u = new URL(url);
+        const name = u.pathname.split('/').filter(Boolean).pop() || 'file.apk';
+        return name;
+    } catch {
+        return 'file.apk';
+    }
+};
 
 const createRatingStars = rating => {
     const fullStars = Math.floor(rating);
@@ -241,53 +270,347 @@ async function showVersionHistory(appId) {
     }
 }
 
-async function downloadApp(appId, sdkVersion) {
+async function downloadApp(appId, sdkVersion, options = {}) {
     ModalManager.show('downloadModal', 'downloadResults', '<div class="text-center p-4"><p class="text-gray-600">Obtaining download link...</p></div>');
 
-    try {
+    const openDownload = (url) => {
+        // Use a user-initiated click handler to open/download reliably without navigating away.
+        const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
+        if (!newWindow) {
+            // Pop-up blocked: fall back to same-tab navigation.
+            window.location.href = url;
+        }
+    };
+
+    const requestDownloadLink = async (withoutSplits, screenDensity) => {
         const response = await fetch('https://backapi.rustore.ru/applicationData/v2/download-link', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                "appId": appId,
-                "firstInstall": true,   // can be true or false (no difference)
-                "mobileServices": [],   // optional
-                "supportedAbis": [	    // optional
-                    "x86_64",
-                    "arm64-v8a",
-                    "x86",
-                    "armeabi-v7a",
-                    "armeabi"
+            body: JSON.stringify({
+                appId,
+                firstInstall: true,
+                mobileServices: [],
+                supportedAbis: [
+                    'x86_64',
+                    'arm64-v8a',
+                    'x86',
+                    'armeabi-v7a',
+                    'armeabi'
                 ],
-                "screenDensity": 0,     // TODO: fix, currently set to 0
-                "supportedLocales": [   // optional
-                    "ru_RU"
-                ],
-                "sdkVersion": sdkVersion,
-                "withoutSplits": true,
-                "signatureFingerprint": null
+                screenDensity,
+                supportedLocales: ['ru_RU'],
+                sdkVersion,
+                withoutSplits,
+                signatureFingerprint: null
             })
         });
 
         if (!response.ok) {
-            // Trying to parse the error body
             const errBody = await response.json().catch(() => ({}));
             throw new Error(`HTTP ${response.status}: ${errBody.message || 'Unknown error'}`);
         }
+        return response.json();
+    };
 
-        const data = await response.json();
+    const renderDownloadLinks = (data, { screenDensity, withoutSplitsUsed }) => {
+        const container = document.getElementById('downloadResults');
+        const urls = data?.body?.downloadUrls || [];
+        const signature = data?.body?.signature || '';
 
-        if (data.code !== 'OK') {
-            throw new Error(data.message || 'Server returned error');
+        const allLinks = urls.map(u => u.url).filter(Boolean);
+        const firstLink = allLinks[0];
+        const isSplitSet = allLinks.length > 1;
+
+        const buildDownloadPlan = () => {
+            const versionCode = data?.body?.versionCode ?? 'unknown';
+            const items = urls
+                .map((u, idx) => ({
+                    idx,
+                    url: u?.url,
+                    size: typeof u?.size === 'number' ? u.size : null,
+                    hash: u?.hash ? String(u.hash) : null
+                }))
+                .filter(i => !!i.url);
+
+            const sortedBySize = [...items].sort((a, b) => (b.size || 0) - (a.size || 0));
+            const baseIdx = sortedBySize[0]?.idx;
+            let configCounter = 1;
+
+            return items.map(i => {
+                const safeHash = (i.hash || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 12);
+                if (i.idx === baseIdx) {
+                    return {
+                        ...i,
+                        role: 'base',
+                        filename: `rustore_${appId}_${versionCode}_base${safeHash ? '_' + safeHash : ''}.apk`
+                    };
+                }
+                const n = configCounter++;
+                return {
+                    ...i,
+                    role: 'config',
+                    filename: `rustore_${appId}_${versionCode}_config${n}${safeHash ? '_' + safeHash : ''}.apk`
+                };
+            });
+        };
+
+        const plan = buildDownloadPlan();
+
+        const copyLinksButton = allLinks.length
+            ? `<button class="download-btn" id="copyDownloadLinks">Copy links</button>`
+            : '';
+
+        const copyPowerShellButton = allLinks.length
+            ? `<button class="download-btn" id="copyPwshScript">Copy PowerShell script</button>`
+            : '';
+
+        const copyCurlButton = allLinks.length
+            ? `<button class="download-btn" id="copyCurlCommands">Copy curl commands</button>`
+            : '';
+
+        const copyAdbButton = isSplitSet
+            ? `<button class="download-btn" id="copyAdbInstall">Copy adb install command</button>`
+            : '';
+
+        const densityOptions = [160, 240, 320, 480, 640, 0];
+        const densitySelect = `
+            <label class="text-sm text-gray-700">Screen density</label>
+            <select id="screenDensitySelect" class="bg-gray-50 border border-gray-300 text-gray-900 rounded-lg px-2 py-1 ml-2">
+                ${densityOptions.map(d => `<option value="${d}" ${Number(d) === Number(screenDensity) ? 'selected' : ''}>${d === 0 ? '0 (auto/unknown)' : d}</option>`).join('')}
+            </select>
+            <button class="download-btn ml-2" id="retryDownload">Retry</button>
+        `;
+
+        container.innerHTML = `
+            <div class="space-y-3">
+                <div class="p-3 bg-gray-50 rounded-lg">
+                    <div class="text-sm text-gray-700">
+                        <div><span class="font-semibold">Used profile:</span> screenDensity=${escapeHtml(screenDensity)} • withoutSplits=${escapeHtml(withoutSplitsUsed)}</div>
+                        ${isSplitSet ? '<div class="mt-1 text-sm text-gray-600">This app is delivered as a split APK set (multiple APK files). Download all parts to install.</div>' : ''}
+                    </div>
+                    <div class="mt-2">${densitySelect}</div>
+                </div>
+
+                <div class="text-sm text-gray-700">
+                    <div><span class="font-semibold">App ID:</span> ${escapeHtml(data?.body?.appId)}</div>
+                    <div><span class="font-semibold">Version Code:</span> ${escapeHtml(data?.body?.versionCode)}</div>
+                    <div><span class="font-semibold">Version ID:</span> ${escapeHtml(data?.body?.versionId)}</div>
+                    ${signature ? `<div class="break-all"><span class="font-semibold">Signature:</span> ${escapeHtml(signature)}</div>` : ''}
+                </div>
+
+                ${firstLink ? `
+                    <div class="p-3 bg-green-50 rounded-lg">
+                        <div class="text-green-700 font-semibold mb-2">Direct download link</div>
+                        <a href="${escapeHtml(firstLink)}" class="text-blue-600 underline break-all" rel="noopener noreferrer" target="_blank">${escapeHtml(firstLink)}</a>
+                        <div class="mt-3 flex gap-2 flex-wrap">
+                            <button class="download-btn" id="startPrimaryDownload">Start download</button>
+                            ${copyLinksButton}
+                            ${copyPowerShellButton}
+                            ${copyCurlButton}
+                            ${copyAdbButton}
+                        </div>
+                        <div class="text-xs text-gray-600 mt-2">If the browser blocks auto-download, use the link above.</div>
+                    </div>
+                ` : ''}
+
+                ${urls.length ? `
+                    <div class="border-t pt-3">
+                        <div class="font-semibold text-gray-800 mb-2">Files</div>
+                        <div class="space-y-2">
+                            ${urls.map((u, idx) => {
+                                const url = u?.url || '';
+                                const size = typeof u?.size === 'number' ? formatFileSize(u.size) : '';
+                                const hash = u?.hash ? String(u.hash) : '';
+                                return `
+                                    <div class="p-3 bg-gray-50 rounded-lg">
+                                        <div class="text-sm text-gray-700 mb-1">#${idx + 1}${size ? ` • ${escapeHtml(size)}` : ''}${hash ? ` • hash: <span class=\"font-mono\">${escapeHtml(hash)}</span>` : ''}</div>
+                                        <a href="${escapeHtml(url)}" class="text-blue-600 underline break-all" rel="noopener noreferrer" target="_blank">${escapeHtml(url)}</a>
+                                        <div class="mt-2">
+                                            <button class="download-btn" data-download-url="${escapeHtml(url)}">Download this file</button>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                ` : ''}
+
+                ${isSplitSet ? `
+                    <div class="border-t pt-3">
+                        <div class="font-semibold text-gray-800 mb-2">How to install (split APK set)</div>
+                        <div class="text-sm text-gray-700 space-y-2">
+                            <div><span class="font-semibold">On Android:</span> install using a split-APK installer (e.g. SAI / APKMirror Installer) and select all downloaded APK files.</div>
+                            <div><span class="font-semibold">On PC (ADB):</span> download all APK parts into one folder, then run <span class="font-mono">adb install-multiple</span> with all files.</div>
+                            <div class="text-xs text-gray-600">Tip: base APK is usually the largest file. Order matters less when you pass all files at once.</div>
+                        </div>
+                    </div>
+                ` : ''}
+
+                <details class="border-t pt-3">
+                    <summary class="cursor-pointer text-sm text-gray-600">Debug JSON</summary>
+                    <pre class="mt-2 whitespace-pre-wrap text-xs bg-gray-900 text-gray-100 p-3 rounded-lg overflow-auto">${escapeHtml(JSON.stringify(data, null, 2))}</pre>
+                </details>
+            </div>
+        `;
+
+        // Wire up actions
+        if (firstLink) {
+            const btn = document.getElementById('startPrimaryDownload');
+            if (btn) {
+                btn.onclick = () => {
+                    openDownload(firstLink);
+                };
+            }
         }
 
-        document.getElementById('downloadResults').innerHTML = JSON.stringify(data, null, 4).replace(
-            /(https?:\/\/[^\s"]+)/g,
-            '<a href="$1" class="text-blue-500 hover:text-blue-700 underline" rel="noopener" download>$1</a>'
-        );
+        container.querySelectorAll('button[data-download-url]').forEach((button) => {
+            button.onclick = () => {
+                const url = button.getAttribute('data-download-url');
+                if (url) openDownload(url);
+            };
+        });
+
+        const copyBtn = document.getElementById('copyDownloadLinks');
+        if (copyBtn) {
+            copyBtn.onclick = async () => {
+                try {
+                    await navigator.clipboard.writeText(allLinks.join('\n'));
+                    copyBtn.textContent = 'Copied';
+                    setTimeout(() => (copyBtn.textContent = 'Copy links'), 1200);
+                } catch {
+                    // Fallback: show prompt
+                    window.prompt('Copy links:', allLinks.join('\n'));
+                }
+            };
+        }
+
+        const toClipboard = async (text, button) => {
+            try {
+                await navigator.clipboard.writeText(text);
+                if (button) {
+                    const old = button.textContent;
+                    button.textContent = 'Copied';
+                    setTimeout(() => (button.textContent = old), 1200);
+                }
+            } catch {
+                window.prompt('Copy:', text);
+            }
+        };
+
+        const pwshBtn = document.getElementById('copyPwshScript');
+        if (pwshBtn) {
+            pwshBtn.onclick = () => {
+                const lines = [];
+                lines.push('$ErrorActionPreference = "Stop"');
+                lines.push('$outDir = Join-Path $PWD "downloads"');
+                lines.push('New-Item -ItemType Directory -Force -Path $outDir | Out-Null');
+                for (const item of plan) {
+                    lines.push(`Invoke-WebRequest -Uri "${item.url}" -OutFile (Join-Path $outDir "${item.filename}")`);
+                }
+                lines.push('Write-Host "Done. Files saved to" $outDir');
+                if (isSplitSet) {
+                    lines.push('');
+                    lines.push('# Install (requires adb in PATH and USB debugging enabled)');
+                    lines.push('$apks = Get-ChildItem -Path $outDir -Filter "*.apk" | Sort-Object Length -Descending | Select-Object -ExpandProperty FullName');
+                    lines.push('Write-Host "Running: adb install-multiple <all apks>"');
+                    lines.push('adb install-multiple @apks');
+                }
+                toClipboard(lines.join('\n'), pwshBtn);
+            };
+        }
+
+        const curlBtn = document.getElementById('copyCurlCommands');
+        if (curlBtn) {
+            curlBtn.onclick = () => {
+                const lines = [];
+                lines.push('mkdir -p downloads');
+                for (const item of plan) {
+                    lines.push(`curl -L "${item.url}" -o "downloads/${item.filename}"`);
+                }
+                if (isSplitSet) {
+                    lines.push('');
+                    lines.push('# Install (requires adb)');
+                    lines.push('adb install-multiple downloads/*.apk');
+                }
+                toClipboard(lines.join('\n'), curlBtn);
+            };
+        }
+
+        const adbBtn = document.getElementById('copyAdbInstall');
+        if (adbBtn) {
+            adbBtn.onclick = () => {
+                const lines = [];
+                lines.push('# PowerShell (Windows)');
+                lines.push('$apks = Get-ChildItem -Path .\downloads -Filter "*.apk" | Sort-Object Length -Descending | Select-Object -ExpandProperty FullName');
+                lines.push('adb install-multiple @apks');
+                lines.push('');
+                lines.push('# Bash (macOS/Linux)');
+                lines.push('adb install-multiple downloads/*.apk');
+                toClipboard(lines.join('\n'), adbBtn);
+            };
+        }
+
+        const retryBtn = document.getElementById('retryDownload');
+        if (retryBtn) {
+            retryBtn.onclick = () => {
+                const select = document.getElementById('screenDensitySelect');
+                const density = select ? Number(select.value) : screenDensity;
+                downloadApp(appId, sdkVersion, { screenDensity: density });
+            };
+        }
+    };
+
+    try {
+        const requestedDensity = Number.isFinite(options.screenDensity)
+            ? Number(options.screenDensity)
+            : guessAndroidScreenDensity();
+
+        // Practical fallback list. Some apps return empty downloadUrls for density 0/160.
+        const densityCandidates = Array.from(new Set([
+            requestedDensity,
+            480,
+            320,
+            240,
+            160,
+            0
+        ].map(Number)));
+
+        const withoutSplitsCandidates = [false, true];
+        let lastData = null;
+        let lastMeta = { screenDensity: requestedDensity, withoutSplitsUsed: false };
+
+        for (const density of densityCandidates) {
+            for (const withoutSplits of withoutSplitsCandidates) {
+                const data = await requestDownloadLink(withoutSplits, density);
+                if (data?.code !== 'OK') {
+                    throw new Error(data?.message || 'Server returned error');
+                }
+                lastData = data;
+                lastMeta = { screenDensity: density, withoutSplitsUsed: withoutSplits };
+
+                const urls = data?.body?.downloadUrls || [];
+                if (Array.isArray(urls) && urls.length > 0) {
+                    renderDownloadLinks(data, lastMeta);
+                    return;
+                }
+            }
+        }
+
+        // If we get here, all attempts returned empty URL lists.
+        document.getElementById('downloadResults').innerHTML = `
+            <div class="p-4 bg-yellow-50 rounded-lg">
+                <div class="font-semibold text-yellow-800">No download URLs returned</div>
+                <div class="text-sm text-yellow-700 mt-2">RuStore API returned <span class="font-mono">OK</span>, but provided an empty URL list for all tried profiles (screenDensity / withoutSplits). This may be a store restriction for this app or an unsupported device profile.</div>
+                <div class="text-sm text-yellow-700 mt-2">Tip: try setting screenDensity to 240/320/480 and retry.</div>
+                <details class="mt-3">
+                    <summary class="cursor-pointer text-sm text-yellow-800">Debug JSON</summary>
+                    <pre class="mt-2 whitespace-pre-wrap text-xs bg-gray-900 text-gray-100 p-3 rounded-lg overflow-auto">${escapeHtml(JSON.stringify(lastData, null, 2))}</pre>
+                </details>
+            </div>
+        `;
     } catch (error) {
         console.error('Error downloading app:', error);
-        ModalManager.showError('downloadResults', 'Unable to obtain download URLs', 'Please try again');
+        ModalManager.showError('downloadResults', 'Unable to obtain download URLs', error?.message ? String(error.message) : 'Please try again');
     }
 }
 
